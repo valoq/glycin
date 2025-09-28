@@ -14,7 +14,7 @@ use crate::{config, Error, MimeType};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 /// Sandboxing mechanism for image loading and editing
 pub enum SandboxMechanism {
-    Bwrap,
+    NativeSandbox,
     FlatpakSpawn,
     NotSandboxed,
 }
@@ -24,14 +24,14 @@ impl SandboxMechanism {
         match RunEnvironment::cached().await {
             RunEnvironment::FlatpakDevel => Self::NotSandboxed,
             RunEnvironment::Flatpak => Self::FlatpakSpawn,
-            RunEnvironment::Host => Self::Bwrap,
+            RunEnvironment::Host => Self::NativeSandbox,
             RunEnvironment::HostBwrapSyscallsBlocked => Self::NotSandboxed,
         }
     }
 
     pub fn into_selector(self) -> SandboxSelector {
         match self {
-            Self::Bwrap => SandboxSelector::Bwrap,
+            Self::NativeSandbox => SandboxSelector::NativeSandbox,
             Self::FlatpakSpawn => SandboxSelector::FlatpakSpawn,
             Self::NotSandboxed => SandboxSelector::NotSandboxed,
         }
@@ -45,7 +45,7 @@ impl SandboxMechanism {
 /// Method by which the [`SandboxMechanism`] is selected
 pub enum SandboxSelector {
     #[default]
-    /// This mode selects `bwrap` outside of Flatpaks and usually
+    /// This mode selects `NativeSandbox` outside of Flatpaks and usually
     /// `flatpak-spawn` inside of Flatpaks. The sandbox is disabled
     /// automatically inside of Flatpak development environments. See
     /// details below.
@@ -57,7 +57,7 @@ pub enum SandboxSelector {
     /// `flatpak-builder --run` (i.e. without installed Flatpak) and the app id
     /// ends with `Devel`, the sandbox is disabled.
     Auto,
-    Bwrap,
+    NativeSandbox,
     FlatpakSpawn,
     NotSandboxed,
 }
@@ -66,7 +66,7 @@ impl SandboxSelector {
     pub async fn determine_sandbox_mechanism(self) -> SandboxMechanism {
         match self {
             Self::Auto => SandboxMechanism::detect().await,
-            Self::Bwrap => SandboxMechanism::Bwrap,
+            Self::NativeSandbox => SandboxMechanism::NativeSandbox,
             Self::FlatpakSpawn => SandboxMechanism::FlatpakSpawn,
             Self::NotSandboxed => SandboxMechanism::NotSandboxed,
         }

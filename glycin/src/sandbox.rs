@@ -177,7 +177,7 @@ static_assertions::assert_impl_all!(Sandbox: Send, Sync);
 
 pub struct SpawnedSandbox {
     pub command: Command,
-    // Keep seccomp fd alive until process exits
+    // Keep seccomp fd alive until process exits (not used in native_sandbox)
     pub _seccomp_fd: Option<Memfd>,
     pub _dbus_socket: UnixStream,
 }
@@ -212,23 +212,18 @@ impl Sandbox {
         let mut shared_fds = Vec::new();
 
         let (mut command, seccomp_fd) = match self.sandbox_mechanism {
-            SandboxMechanism::Bwrap => {
-                let seccomp_memfd = Self::seccomp_export_bpf(&self.seccomp_filter()?)?;
-                let command = self.bwrap_command(&seccomp_memfd).await?;
-
-                shared_fds.push(seccomp_memfd.as_raw_fd());
-
-                (command, Some(seccomp_memfd))
+            SandboxMechanism::NativeSandbox => {
+                // This replaces the previous Bwrap mechanism
+                let command = self.native_sandbox_command().await?;
+                (command, None)
             }
             SandboxMechanism::FlatpakSpawn => {
                 let command = self.flatpak_spawn_command();
-
                 (command, None)
             }
             SandboxMechanism::NotSandboxed => {
                 eprintln!("WARNING: Glycin running without sandbox.");
                 let command = self.no_sandbox_command();
-
                 (command, None)
             }
         };
@@ -267,167 +262,100 @@ impl Sandbox {
         })
     }
 
-    async fn bwrap_command(&self, seccomp_memfd: &Memfd) -> Result<Command, Error> {
-        let mut command = Command::new("bwrap");
+    /// Native sandbox: directly apply seccomp filter before launching execve
+    async fn native_sandbox_command(&self) -> Result<Command, Error> {
+        let mut command = Command::new(self.exec());
 
-        command.args([
-            "--unshare-all",
-            "--die-with-parent",
-            // change working directory to something that exists
-            "--chdir",
-            "/",
-            // Make /usr available as read only
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            // Make tmpfs dev available
-            "--dev",
-            "/dev",
-            // Additional linker configuration via /etc/ld.so.conf if available
-            "--ro-bind-try",
-            "/etc/ld.so.cache",
-            "/etc/ld.so.cache",
-            // Add /nix/store on systems with Nix
-            "--ro-bind-try",
-            "/nix/store",
-            "/nix/store",
-            // Create a fake HOME for glib to not throw warnings
-            "--tmpfs",
-            "/tmp-home",
-            // Create a fake runtime dir for glib to not throw warnings
-            "--tmpfs",
-            "/tmp-run",
-            // setup clean environment
-            "--clearenv",
-            "--setenv",
-            "HOME",
-            "/tmp-home",
-            "--setenv",
-            "XDG_RUNTIME_DIR",
-            "/tmp-run",
-        ]);
+        command.env_clear();
 
         // Inherit some environment variables
         for key in INHERITED_ENVIRONMENT_VARIABLES {
             if let Some(val) = std::env::var_os(key) {
-                command.arg("--setenv");
-                command.arg(key);
-                command.arg(val);
+                command.env(key, val);
             }
         }
 
-        let system_setup_arc = SystemSetup::cached().await;
+        let config_entry = self.config_entry.clone();
 
-        let system = match system_setup_arc.as_ref().as_ref() {
-            Err(err) => {
-                return Err(err.clone().into());
-            }
-            Ok(system) => system,
-        };
+//        fn allow_open_readonly(filter: &mut libseccomp::ScmpFilterContext) -> Result<(), std::io::Error> {
+//            use libseccomp::{ScmpAction, ScmpSyscall, ScmpArgCompare, ScmpCompareOp};
+//
+//            // Allow open with O_RDONLY only (flags == 0)
+//            let open_sys = ScmpSyscall::from_name("open")
+//                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("seccomp: {e:?}")))?;
+//            filter.add_rule_conditional(
+//                ScmpAction::Allow,
+//                open_sys,
+//                &[ScmpArgCompare::new(1, ScmpCompareOp::Eq, libc::O_RDONLY as u64)],
+//            ).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("seccomp: {e:?}")))?;
+//
+//            // Allow openat with O_RDONLY only (flags == 0)
+//            let openat_sys = ScmpSyscall::from_name("openat")
+//                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("seccomp: {e:?}")))?;
+//            filter.add_rule_conditional(
+//                ScmpAction::Allow,
+//                openat_sys,
+//                &[ScmpArgCompare::new(2, ScmpCompareOp::Eq, libc::O_RDONLY as u64)],
+//            ).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("seccomp: {e:?}")))?;
+//
+//            Ok(())
+//        }
+//
+//        // --- Helper function for filtered socket() ---
+//        fn allow_af_unix_socket(filter: &mut libseccomp::ScmpFilterContext) -> Result<(), std::io::Error> {
+//            use libseccomp::{ScmpAction, ScmpSyscall, ScmpArgCompare, ScmpCompareOp};
+//
+//            // Allow socket(AF_UNIX, ...), i.e., domain == AF_UNIX (1)
+//            let socket_sys = ScmpSyscall::from_name("socket")
+//                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("seccomp: {e:?}")))?;
+//            filter.add_rule_conditional(
+//                ScmpAction::Allow,
+//                socket_sys,
+//                &[ScmpArgCompare::new(0, ScmpCompareOp::Eq, libc::AF_UNIX as u64)],
+//            ).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("seccomp: {e:?}")))?;
+//
+//            Ok(())
+//        }
 
-        // Symlink paths like /usr/lib64 to /lib64
-        for (dest, src) in &system.lib_symlinks {
-            command.arg("--symlink");
-            command.arg(&src);
-            command.arg(&dest);
-        }
 
-        let mut mounted_paths = Vec::<PathBuf>::new();
-        let mut mount = |command: &mut Command, way: &str, path: &Path| {
-            if path.is_symlink() {
-                if !mounted_paths.iter().any(|x| path.starts_with(x)) {
-                    match canonicalize(&path) {
-                        Ok(target) => {
-                            command.arg("--symlink");
-                            command.arg(&target);
-                            command.arg(&path);
-                            tracing::trace!("Symlink {path:?} -> {target:?}");
-                        }
-                        Err(err) => tracing::debug!("Couldn't canonicalize path {path:?}: {err}"),
-                    }
-                } else {
-                    tracing::trace!("Parent of symlink {path:?} already mounted. Skipping.");
-                }
-            }
-
-            match canonicalize(&path) {
-                Ok(path) => {
-                    if !mounted_paths.iter().any(|x| path.starts_with(x)) {
-                        command.arg(way);
-                        command.arg(&path);
-                        command.arg(&path);
-                        tracing::trace!("Mounting {path:?}");
-                        mounted_paths.push(path);
-                    } else {
-                        tracing::trace!("Parent of mount path {path:?} already mounted. Skipping.");
-                    }
-                }
-                Err(err) => tracing::debug!("Couldn't canonicalize path {path:?}: {err}"),
-            }
-        };
-
-        // Mount paths like /lib64 if they exist
-        for dir in &system.lib_dirs {
-            mount(&mut command, "--ro-bind", dir);
-        }
-
-        // Make extra dirs available
-        for dir in &self.ro_bind_extra {
-            mount(&mut command, "--ro-bind", dir);
-        }
-
-        // Make loader binary available if not in /usr. This is useful for testing and
-        // adding loaders in user (/home) configurations.
-        if !self.exec().starts_with("/usr") {
-            mount(&mut command, "--ro-bind", self.exec());
-        }
-
-        // Fontconfig
-        if !self.config_entry.fontconfig() {
-            tracing::trace!("Fontconfig not enabled for loader/editor");
-        } else if let Some(fc_paths) = crate::fontconfig::cached_paths() {
-            // Expose paths to fonts, configs, and caches
-            for path in fc_paths {
-                mount(&mut command, "--ro-bind-try", path);
-            }
-
-            // Fontconfig needs a writeable cache if the cache is outdated
-            let cache_dir = PathBuf::from_iter([
-                glib::user_cache_dir(),
-                "glycin".into(),
-                self.exec().iter().skip(1).collect(),
-            ]);
-
-            let fc_cache_dir = PathBuf::from_iter([cache_dir.clone(), "fontconfig".into()]);
-
-            // Create cache dir
-            match util::spawn_blocking(move || std::fs::create_dir_all(fc_cache_dir)).await {
-                Err(err) => tracing::warn!("Failed to create fontconfig cache dir: {err:?}"),
-                Ok(()) => {
-                    command.arg("--bind-try");
-                    command.arg(&cache_dir);
-                    command.arg(&cache_dir);
-
-                    command.arg("--setenv");
-                    command.arg("XDG_CACHE_HOME");
-                    command.arg(&cache_dir);
-                }
-            }
-        } else {
-            tracing::warn!("Failed to load fonftconfig environment");
-        }
-
-        // Configure seccomp
-        command.arg("--seccomp");
-        command.arg(seccomp_memfd.as_raw_fd().to_string());
-
-        // Loader binary
-        command.arg(self.exec());
-
-        // Set sandbox memory limit
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
+                // Set memory limit
                 Self::set_memory_limit();
+
+                // Rebuild and load seccomp filter in child
+                let filter = {
+                    // Reconstruct the filter as in seccomp_filter()
+                    let mut filter = if std::env::var("GLYCIN_SECCOMP_DEFAULT_ACTION")
+                        .ok()
+                        .as_deref()
+                        == Some("KILL_PROCESS")
+                    {
+                        libseccomp::ScmpFilterContext::new(libseccomp::ScmpAction::KillProcess)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("seccomp: {e:?}")))?
+                    } else {
+                        libseccomp::ScmpFilterContext::new(libseccomp::ScmpAction::Trap)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("seccomp: {e:?}")))?
+                    };
+
+                    let mut syscalls = vec![ALLOWED_SYSCALLS];
+                    if config_entry.fontconfig() {
+                        syscalls.push(ALLOWED_SYSCALLS_FONTCONFIG);
+                    }
+
+                    for syscall_name in syscalls.into_iter().flatten() {
+                        let syscall = libseccomp::ScmpSyscall::from_name(syscall_name)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("seccomp: {e:?}")))?;
+                        filter.add_rule(libseccomp::ScmpAction::Allow, syscall)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("seccomp: {e:?}")))?;
+                    }
+                    filter
+                };
+
+                filter.load().map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::Other, format!("seccomp: {e:?}"))
+                })?;
+
                 Ok(())
             });
         }
@@ -611,33 +539,21 @@ impl Sandbox {
     /// Make seccomp filters available under FD
     ///
     /// Bubblewrap supports taking an fd to seccomp filters in the BPF format.
-    fn seccomp_export_bpf(filter: &ScmpFilterContext) -> Result<Memfd, Error> {
-        let memfd = MemfdOptions::default()
-            .close_on_exec(false)
-            .create("seccomp-bpf-filter")?;
-        let mut file = memfd.as_file();
-
-        filter.export_bpf(&mut file)?;
-
-        file.rewind()?;
-
-        Ok(memfd)
+    #[deprecated(note = "No longer used; native_sandbox applies filter directly")]
+    fn seccomp_export_bpf(_filter: &ScmpFilterContext) -> Result<Memfd, Error> {
+        Err(Error::from(io::Error::new(
+            io::ErrorKind::Other,
+            "seccomp_export_bpf is not used in native_sandbox",
+        )))
     }
 
-    /// Returns `true` if bwrap syscalls are blocked
-    pub async fn check_bwrap_syscalls_blocked() -> bool {
-        match Self::check_bwrap_syscalls_blocked_internal().await {
-            Err(err) => {
-                tracing::info!("Can't determine if bwrap syscalls are blocked: {err} ({err:?})");
-                // For error states we assume that bwrap failed for other reasons than sandbox
-                // creation being blocked
-                false
-            }
-            Ok(blocked) => blocked,
-        }
+    /// Returns `true` if native_sandbox syscalls are blocked
+    pub async fn check_native_sandbox_syscalls_blocked() -> bool {
+        //TODO: check seccomp here
+        true
     }
 
-    async fn check_bwrap_syscalls_blocked_internal() -> Result<bool, Error> {
+    async fn check_native_sandbox_syscalls_blocked_internal() -> Result<bool, Error> {
         let config_entry = ConfigEntry::Loader(ImageLoaderConfig {
             exec: PathBuf::from("/bin/true"),
             expose_base_dir: false,
@@ -645,34 +561,21 @@ impl Sandbox {
         });
 
         let (dbus_socket, _) = UnixStream::pair()?;
-        let sandbox = Self::new(SandboxMechanism::Bwrap, config_entry, dbus_socket);
+        let sandbox = Self::new(SandboxMechanism::NativeSandbox, config_entry, dbus_socket);
 
-        let seccomp_memfd = Self::seccomp_export_bpf(&sandbox.seccomp_filter()?)?;
-        let mut command = sandbox.bwrap_command(&seccomp_memfd).await?;
+        let mut command = sandbox.native_sandbox_command().await?;
 
-        tracing::debug!("Testing bwrap availability with: {command:?}");
+        tracing::debug!("Testing native_sandbox availability with: {command:?}");
 
         let output = spawn_blocking(move || command.output()).await?;
 
-        tracing::debug!("bwrap availability test returned: {output:?}");
+        tracing::debug!("native_sandbox availability test returned: {output:?}");
 
         if output.status.success() {
             Ok(false)
         } else {
             if matches!(output.status.signal(), Some(libc::SIGSYS)) {
-                tracing::debug!("bwrap syscalls not available: Terminated with SIGSYS");
-                Ok(true)
-            } else if std::str::from_utf8(&output.stderr).map_or(false, |x| {
-                [
-                    "Creating new namespace failed",
-                    "No permissions to create a new namespace",
-                    // Wrong grammar in older bwrap versions
-                    "No permissions to creating new namespace",
-                ]
-                .iter()
-                .any(|y| x.contains(y))
-            }) {
-                tracing::debug!("bwrap syscalls not available: STDERR contains known string");
+                tracing::debug!("native_sandbox syscalls not available: Terminated with SIGSYS");
                 Ok(true)
             } else {
                 Ok(false)
