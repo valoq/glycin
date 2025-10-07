@@ -63,6 +63,7 @@ tracing-subscriber = { workspace = true, optional = true }
 tracing.workspace = true
 yeslogic-fontconfig-sys.workspace = true
 zbus = { workspace = true, features = ["p2p"] }
+landlock.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

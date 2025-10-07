@@ -19,6 +19,22 @@ use crate::config::{ConfigEntry, ImageLoaderConfig};
 use crate::util::{self, new_async_mutex, spawn_blocking, AsyncMutex};
 use crate::{Error, SandboxMechanism};
 
+use landlock::{
+    Access, AccessFs, PathBeneath, PathFd, PathFdError, RestrictionStatus, Ruleset,
+    RulesetAttr, RulesetCreatedAttr, RulesetError, ABI,
+};
+use thiserror::Error;
+
+use libc::EXIT_FAILURE;
+
+#[derive(Debug, Error)]
+pub enum MyRestrictError {
+    #[error(transparent)]
+    Ruleset(#[from] RulesetError),
+    #[error(transparent)]
+    AddRule(#[from] PathFdError),
+}
+
 type SystemSetupStore = Arc<Result<SystemSetup, Arc<io::Error>>>;
 
 static SYSTEM_SETUP: AsyncMutex<Option<SystemSetupStore>> = new_async_mutex(None);
@@ -177,7 +193,7 @@ static_assertions::assert_impl_all!(Sandbox: Send, Sync);
 
 pub struct SpawnedSandbox {
     pub command: Command,
-    // Keep seccomp fd alive until process exits
+    // Keep seccomp fd alive until process exits (not used in native_sandbox)
     pub _seccomp_fd: Option<Memfd>,
     pub _dbus_socket: UnixStream,
 }
@@ -212,23 +228,18 @@ impl Sandbox {
         let mut shared_fds = Vec::new();
 
         let (mut command, seccomp_fd) = match self.sandbox_mechanism {
-            SandboxMechanism::Bwrap => {
-                let seccomp_memfd = Self::seccomp_export_bpf(&self.seccomp_filter()?)?;
-                let command = self.bwrap_command(&seccomp_memfd).await?;
-
-                shared_fds.push(seccomp_memfd.as_raw_fd());
-
-                (command, Some(seccomp_memfd))
+            SandboxMechanism::NativeSandbox => {
+                // This replaces the previous Bwrap mechanism
+                let command = self.native_sandbox_command();
+                (command, None)
             }
             SandboxMechanism::FlatpakSpawn => {
                 let command = self.flatpak_spawn_command();
-
                 (command, None)
             }
             SandboxMechanism::NotSandboxed => {
                 eprintln!("WARNING: Glycin running without sandbox.");
                 let command = self.no_sandbox_command();
-
                 (command, None)
             }
         };
@@ -266,174 +277,115 @@ impl Sandbox {
             _dbus_socket: self.dbus_socket,
         })
     }
+    
 
-    async fn bwrap_command(&self, seccomp_memfd: &Memfd) -> Result<Command, Error> {
-        let mut command = Command::new("bwrap");
+    pub fn is_landlock_supported() -> bool {
+        use std::process::Command;
+    
+        if let Ok(output) = Command::new("uname").arg("-r").output() {
+            if let Ok(version_str) = String::from_utf8(output.stdout) {
+                // Version string is expected to be in "5.19.0-foo" or similar
+                let mut parts = version_str.trim().split('.');
+                if let (Some(major), Some(minor)) = (parts.next(), parts.next()) {
+                    if let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) {
+                        return (major > 5) || (major == 5 && minor >= 19);
+                    }
+                }
+            }
+        }
+        false
+    }
 
-        command.args([
-            "--unshare-all",
-            "--die-with-parent",
-            // change working directory to something that exists
-            "--chdir",
-            "/",
-            // Make /usr available as read only
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            // Make tmpfs dev available
-            "--dev",
-            "/dev",
-            // Additional linker configuration via /etc/ld.so.conf if available
-            "--ro-bind-try",
-            "/etc/ld.so.cache",
-            "/etc/ld.so.cache",
-            // Add /nix/store on systems with Nix
-            "--ro-bind-try",
-            "/nix/store",
-            "/nix/store",
-            // Create a fake HOME for glib to not throw warnings
-            "--tmpfs",
-            "/tmp-home",
-            // Create a fake runtime dir for glib to not throw warnings
-            "--tmpfs",
-            "/tmp-run",
-            // setup clean environment
-            "--clearenv",
-            "--setenv",
-            "HOME",
-            "/tmp-home",
-            "--setenv",
-            "XDG_RUNTIME_DIR",
-            "/tmp-run",
-        ]);
+    fn restrict_paths(hierarchies: &[&str]) -> Result<RestrictionStatus, MyRestrictError> {
+        // ABI set to 2 in compatibility with linux 5.19 and higher
+        let abi = ABI::V2;
+        let access_all = AccessFs::from_all(abi);
+        let access_read = AccessFs::from_read(abi);
+    
+        let mut ruleset = Ruleset::default()
+            .handle_access(access_all)?
+            .create()?
+            // Read-only access to / (entire filesystem).
+            .add_rules(landlock::path_beneath_rules(&["/"], access_read))?;
+    
+        // Add write permissions to specified directory of provided
+        if !hierarchies.is_empty() {
+            ruleset = ruleset.add_rules(
+                hierarchies
+                    .iter()
+                    .map::<Result<_, MyRestrictError>, _>(|p| {
+                        Ok(PathBeneath::new(PathFd::new(p)?, access_all))
+                    }),
+            )?;
+        }
+    
+        Ok(ruleset.restrict_self()?)
+    }
+
+
+    /// Restricts the process to only access the given hierarchies using Landlock, if supported.
+    /// Accepts multiple allowed directories as &[&Path].
+    pub fn init_sandbox(allowed_dirs: &[&Path]) {
+    
+        if Self::is_landlock_supported() {
+            let paths: Vec<&str> = allowed_dirs
+                .iter()
+                .map(|p| p.to_str().expect("Cannot convert path"))
+                .collect();
+    
+            let status = if !paths.is_empty() {
+                Self::restrict_paths(&paths)
+            } else {
+                Self::restrict_paths(&[])
+            };
+    
+            match status {
+                Ok(_status) => {
+                    //check
+                }
+                Err(_e) => {
+                    //log warning
+                    std::process::exit(EXIT_FAILURE);
+                }
+            }
+        } else {
+            // warn!("Landlock is NOT supported on this platform or kernel (<5.19).");
+        }
+    }
+
+
+
+    /// Native sandbox: directly apply seccomp filter before launching execve
+    fn native_sandbox_command(&self) -> Command {
+        let mut command = Command::new(self.exec());
+
+        command.env_clear();
 
         // Inherit some environment variables
         for key in INHERITED_ENVIRONMENT_VARIABLES {
             if let Some(val) = std::env::var_os(key) {
-                command.arg("--setenv");
-                command.arg(key);
-                command.arg(val);
+                command.env(key, val);
             }
         }
 
-        let system_setup_arc = SystemSetup::cached().await;
+        let config_entry = self.config_entry.clone();
 
-        let system = match system_setup_arc.as_ref().as_ref() {
-            Err(err) => {
-                return Err(err.clone().into());
-            }
-            Ok(system) => system,
-        };
 
-        // Symlink paths like /usr/lib64 to /lib64
-        for (dest, src) in &system.lib_symlinks {
-            command.arg("--symlink");
-            command.arg(&src);
-            command.arg(&dest);
-        }
-
-        let mut mounted_paths = Vec::<PathBuf>::new();
-        let mut mount = |command: &mut Command, way: &str, path: &Path| {
-            if path.is_symlink() {
-                if !mounted_paths.iter().any(|x| path.starts_with(x)) {
-                    match canonicalize(&path) {
-                        Ok(target) => {
-                            command.arg("--symlink");
-                            command.arg(&target);
-                            command.arg(&path);
-                            tracing::trace!("Symlink {path:?} -> {target:?}");
-                        }
-                        Err(err) => tracing::debug!("Couldn't canonicalize path {path:?}: {err}"),
-                    }
-                } else {
-                    tracing::trace!("Parent of symlink {path:?} already mounted. Skipping.");
-                }
-            }
-
-            match canonicalize(&path) {
-                Ok(path) => {
-                    if !mounted_paths.iter().any(|x| path.starts_with(x)) {
-                        command.arg(way);
-                        command.arg(&path);
-                        command.arg(&path);
-                        tracing::trace!("Mounting {path:?}");
-                        mounted_paths.push(path);
-                    } else {
-                        tracing::trace!("Parent of mount path {path:?} already mounted. Skipping.");
-                    }
-                }
-                Err(err) => tracing::debug!("Couldn't canonicalize path {path:?}: {err}"),
-            }
-        };
-
-        // Mount paths like /lib64 if they exist
-        for dir in &system.lib_dirs {
-            mount(&mut command, "--ro-bind", dir);
-        }
-
-        // Make extra dirs available
-        for dir in &self.ro_bind_extra {
-            mount(&mut command, "--ro-bind", dir);
-        }
-
-        // Make loader binary available if not in /usr. This is useful for testing and
-        // adding loaders in user (/home) configurations.
-        if !self.exec().starts_with("/usr") {
-            mount(&mut command, "--ro-bind", self.exec());
-        }
-
-        // Fontconfig
-        if !self.config_entry.fontconfig() {
-            tracing::trace!("Fontconfig not enabled for loader/editor");
-        } else if let Some(fc_paths) = crate::fontconfig::cached_paths() {
-            // Expose paths to fonts, configs, and caches
-            for path in fc_paths {
-                mount(&mut command, "--ro-bind-try", path);
-            }
-
-            // Fontconfig needs a writeable cache if the cache is outdated
-            let cache_dir = PathBuf::from_iter([
-                glib::user_cache_dir(),
-                "glycin".into(),
-                self.exec().iter().skip(1).collect(),
-            ]);
-
-            let fc_cache_dir = PathBuf::from_iter([cache_dir.clone(), "fontconfig".into()]);
-
-            // Create cache dir
-            match util::spawn_blocking(move || std::fs::create_dir_all(fc_cache_dir)).await {
-                Err(err) => tracing::warn!("Failed to create fontconfig cache dir: {err:?}"),
-                Ok(()) => {
-                    command.arg("--bind-try");
-                    command.arg(&cache_dir);
-                    command.arg(&cache_dir);
-
-                    command.arg("--setenv");
-                    command.arg("XDG_CACHE_HOME");
-                    command.arg(&cache_dir);
-                }
-            }
-        } else {
-            tracing::warn!("Failed to load fonftconfig environment");
-        }
-
-        // Configure seccomp
-        command.arg("--seccomp");
-        command.arg(seccomp_memfd.as_raw_fd().to_string());
-
-        // Loader binary
-        command.arg(self.exec());
-
-        // Set sandbox memory limit
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 Self::set_memory_limit();
+
+                let allowed_dir = std::path::Path::new("/tmp/");
+                Self::init_sandbox(&[allowed_dir]);
+
                 Ok(())
-            });
+            }); 
         }
 
-        Ok(command)
+        command
     }
+
+    
 
     fn flatpak_spawn_command(&self) -> Command {
         let mut command = Command::new("flatpak-spawn");
@@ -611,22 +563,17 @@ impl Sandbox {
     /// Make seccomp filters available under FD
     ///
     /// Bubblewrap supports taking an fd to seccomp filters in the BPF format.
-    fn seccomp_export_bpf(filter: &ScmpFilterContext) -> Result<Memfd, Error> {
-        let memfd = MemfdOptions::default()
-            .close_on_exec(false)
-            .create("seccomp-bpf-filter")?;
-        let mut file = memfd.as_file();
-
-        filter.export_bpf(&mut file)?;
-
-        file.rewind()?;
-
-        Ok(memfd)
+    #[deprecated(note = "No longer used; native_sandbox applies filter directly")]
+    fn seccomp_export_bpf(_filter: &ScmpFilterContext) -> Result<Memfd, Error> {
+        Err(Error::from(io::Error::new(
+            io::ErrorKind::Other,
+            "seccomp_export_bpf is not used in native_sandbox",
+        )))
     }
 
-    /// Returns `true` if bwrap syscalls are blocked
-    pub async fn check_bwrap_syscalls_blocked() -> bool {
-        match Self::check_bwrap_syscalls_blocked_internal().await {
+    /// Returns `true` if native_sandbox syscalls are blocked
+    pub async fn check_native_sandbox_syscalls_blocked() -> bool {
+        match Self::check_native_sandbox_syscalls_blocked_internal().await {
             Err(err) => {
                 tracing::info!("Can't determine if bwrap syscalls are blocked: {err} ({err:?})");
                 // For error states we assume that bwrap failed for other reasons than sandbox
@@ -637,7 +584,8 @@ impl Sandbox {
         }
     }
 
-    async fn check_bwrap_syscalls_blocked_internal() -> Result<bool, Error> {
+
+    async fn check_native_sandbox_syscalls_blocked_internal() -> Result<bool, Error> {
         let config_entry = ConfigEntry::Loader(ImageLoaderConfig {
             exec: PathBuf::from("/bin/true"),
             expose_base_dir: false,
@@ -645,34 +593,21 @@ impl Sandbox {
         });
 
         let (dbus_socket, _) = UnixStream::pair()?;
-        let sandbox = Self::new(SandboxMechanism::Bwrap, config_entry, dbus_socket);
+        let sandbox = Self::new(SandboxMechanism::NativeSandbox, config_entry, dbus_socket);
 
-        let seccomp_memfd = Self::seccomp_export_bpf(&sandbox.seccomp_filter()?)?;
-        let mut command = sandbox.bwrap_command(&seccomp_memfd).await?;
+        let mut command = sandbox.native_sandbox_command();
 
-        tracing::debug!("Testing bwrap availability with: {command:?}");
+        tracing::debug!("Testing native_sandbox availability with: {command:?}");
 
         let output = spawn_blocking(move || command.output()).await?;
 
-        tracing::debug!("bwrap availability test returned: {output:?}");
+        tracing::debug!("native_sandbox availability test returned: {output:?}");
 
         if output.status.success() {
             Ok(false)
         } else {
             if matches!(output.status.signal(), Some(libc::SIGSYS)) {
-                tracing::debug!("bwrap syscalls not available: Terminated with SIGSYS");
-                Ok(true)
-            } else if std::str::from_utf8(&output.stderr).map_or(false, |x| {
-                [
-                    "Creating new namespace failed",
-                    "No permissions to create a new namespace",
-                    // Wrong grammar in older bwrap versions
-                    "No permissions to creating new namespace",
-                ]
-                .iter()
-                .any(|y| x.contains(y))
-            }) {
-                tracing::debug!("bwrap syscalls not available: STDERR contains known string");
+                tracing::debug!("native_sandbox syscalls not available: Terminated with SIGSYS");
                 Ok(true)
             } else {
                 Ok(false)

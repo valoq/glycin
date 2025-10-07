@@ -1031,6 +1031,7 @@ dependencies = [
  "glycin-utils",
  "gufo-common",
  "gufo-exif",
+ "landlock",
  "lcms2",
  "lcms2-sys",
  "libc",
@@ -1517,6 +1518,17 @@ checksum = "1cfaf33c695fc6e08064efbc1f72ec937429614f25eef83af942d0e227c3a28f"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "landlock"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "affe8b77dce5b172f8e290bd801b12832a77cd1942d1ea98259916e89d5829d6"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.16",
 ]
 
 [[package]]

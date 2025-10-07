@@ -74,6 +74,7 @@ gufo-exif = { version = "0.3.0" }
 gufo-jpeg = { version = "0.3.0" }
 half = "2.4.1"
 image = { version = "0.25.7", default-features = false }
+landlock = "0.4.3"
 lcms2 = "6.0.3"
 lcms2-sys = "4.0.4"
 libc = "0.2.152"
